@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { homedir } from "node:os";
@@ -70,6 +71,39 @@ async function runErrorBoundaryFixture(
   }
 }
 
+async function runStdoutErrorFixture(
+  mode: "control" | "EPIPE" | "EACCES",
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const fixturePath = fileURLToPath(
+    new URL("./fixtures/stdout-error-bin.mjs", import.meta.url),
+  );
+  const viteNodePath = fileURLToPath(
+    new URL("../node_modules/.bin/vite-node", import.meta.url),
+  );
+
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      viteNodePath,
+      [fixturePath, mode],
+      {
+        cwd: new URL("..", import.meta.url),
+      },
+    );
+    return { exitCode: 0, stdout, stderr };
+  } catch (error) {
+    const result = error as Error & {
+      code: number;
+      stdout: string;
+      stderr: string;
+    };
+    return {
+      exitCode: result.code,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  }
+}
+
 describe("runAxiCli", () => {
   const originalArgv = [...process.argv];
   const stdout = { write: vi.fn(() => true) };
@@ -103,6 +137,27 @@ describe("runAxiCli", () => {
 
     expect(initialize).toHaveBeenCalledTimes(1);
     expect(home).toHaveBeenCalledTimes(1);
+  });
+
+  it("installs one stdout error handler across repeated invocations", async () => {
+    const sharedStdout = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    for (let invocation = 0; invocation < 11; invocation += 1) {
+      await runAxiCli({
+        argv: ["--help"],
+        description: "Manage GitHub state",
+        topLevelHelp: "top help",
+        home,
+        commands: { issue },
+        stdout: sharedStdout,
+      });
+    }
+
+    expect(sharedStdout.listenerCount("error")).toBe(1);
   });
 
   it("shows top-level help for bare --help without resolving context", async () => {
@@ -560,4 +615,29 @@ describe("runAxiCli subprocess integration", () => {
       expect(stderr).toBe("");
     },
   );
+
+  it("treats stdout EPIPE as a normal end", async () => {
+    await expect(runStdoutErrorFixture("EPIPE")).resolves.toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+  });
+
+  it("preserves normal stdout writes", async () => {
+    const result = await runStdoutErrorFixture("control");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("fixture help");
+    expect(result.stderr).toBe("");
+  });
+
+  it("does not swallow non-EPIPE stdout errors", async () => {
+    const result = await runStdoutErrorFixture("EACCES");
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Error: write EACCES");
+    expect(result.stderr).toContain("code: 'EACCES'");
+  });
 });
